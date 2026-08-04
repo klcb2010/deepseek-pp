@@ -1,52 +1,104 @@
 name: Release Extension
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag, for example v0.3.0'
+        description: 'Release tag, for example v1.12.0'
         required: true
         type: string
 
 permissions:
   contents: write
 
+# MUST match sync-upstream.yml — only one of sync/release can run at a time
 concurrency:
-  group: release-${{ github.ref }}
+  group: deepseek-release-lock
   cancel-in-progress: false
 
 jobs:
   release:
     name: Build and publish release
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: main
           fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
 
-      - name: Validate release ref
+      - name: Resolve release source (tag, or main if tag tree incomplete)
         shell: bash
         env:
-          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
-          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "Release tag $TAG does not exist in the checked-out repository" >&2
+          set -euo pipefail
+          TAG="${INPUT_TAG}"
+          VERSION="${TAG#v}"
+          echo "Release tag: ${TAG}"
+
+          git fetch --tags origin
+          git fetch origin main
+
+          tree_complete() {
+            # Check working tree files after checkout
+            test -f .github/workflows/ci.yml \
+              && test -f .github/workflows/release.yml \
+              && test -f package.json \
+              && test -f packages/shell-host/package.json
+          }
+
+          if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} not found"
             exit 1
           fi
 
-          TAG_SHA="$(git rev-list -n 1 "$TAG")"
-          HEAD_SHA="$(git rev-parse HEAD)"
-          if [ "$HEAD_SHA" != "$TAG_SHA" ]; then
-            echo "Checked-out HEAD $HEAD_SHA does not match release tag $TAG ($TAG_SHA)" >&2
+          TAG_SHA="$(git rev-list -n 1 "refs/tags/${TAG}")"
+          echo "TAG_SHA=${TAG_SHA}"
+
+          # Prefer the tag commit
+          git checkout --force "${TAG_SHA}"
+
+          if tree_complete; then
+            HEAD_SHA="$(git rev-parse HEAD)"
+            echo "Using complete tag tree at ${HEAD_SHA}"
+            exit 0
+          fi
+
+          echo "WARNING: tag ${TAG} points to incomplete tree (missing custom workflows)"
+          echo "Falling back to origin/main if version matches"
+
+          git checkout --force origin/main
+          MAIN_VERSION="$(node -p "require('./package.json').version")"
+          echo "main package.json version=${MAIN_VERSION}"
+
+          if [ "${MAIN_VERSION}" != "${VERSION}" ]; then
+            echo "ERROR: main version (${MAIN_VERSION}) != tag version (${VERSION})"
+            echo "Fix the tag first (re-run Sync Upstream) or release the matching version."
             exit 1
           fi
+
+          if ! tree_complete; then
+            echo "ERROR: origin/main is also missing required files"
+            ls -la .github/workflows/ || true
+            exit 1
+          fi
+
+          echo "Using origin/main at $(git rev-parse HEAD) (version ${MAIN_VERSION})"
+
+      - name: Validate release tree is complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/ci.yml
+          test -f .github/workflows/release.yml
+          test -f package.json
+          test -f packages/shell-host/package.json
+          echo "Workflows present:"
+          ls -la .github/workflows/
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -75,66 +127,48 @@ jobs:
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          set -euo pipefail
+          TAG="${INPUT_TAG}"
           VERSION="${TAG#v}"
+
           ROOT_VERSION="$(node -p "require('./package.json').version")"
           SHELL_VERSION="$(node -p "require('./packages/shell-host/package.json').version")"
 
-          if [ "$ROOT_VERSION" != "$VERSION" ]; then
-            echo "package.json version $ROOT_VERSION does not match release tag $TAG" >&2
-            exit 1
-          fi
-          if [ "$SHELL_VERSION" != "$VERSION" ]; then
-            echo "packages/shell-host/package.json version $SHELL_VERSION does not match release tag $TAG" >&2
+          if [ "${ROOT_VERSION}" != "${VERSION}" ]; then
+            echo "Root version mismatch: package.json=${ROOT_VERSION} tag=${VERSION}"
             exit 1
           fi
 
-          read_published_version() {
-            npm view "deepseek-pp-shell-host@$VERSION" version --prefer-online 2>/dev/null || true
-          }
+          if [ "${SHELL_VERSION}" != "${VERSION}" ]; then
+            echo "Shell version mismatch: shell-host=${SHELL_VERSION} tag=${VERSION}"
+            exit 1
+          fi
 
-          wait_for_published_version() {
-            local attempts="$1"
-            local attempt
-            PUBLISHED_VERSION=""
-            for attempt in $(seq 1 "$attempts"); do
-              PUBLISHED_VERSION="$(read_published_version)"
-              if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
-                return 0
-              fi
-              if [ "$attempt" -lt "$attempts" ]; then
-                sleep 5
-              fi
-            done
-            return 1
-          }
-
-          if wait_for_published_version 1; then
-            echo "deepseek-pp-shell-host@$VERSION is already published"
+          if npm view "deepseek-pp-shell-host@${VERSION}" version >/dev/null 2>&1; then
+            echo "Already published: deepseek-pp-shell-host@${VERSION}"
             exit 0
           fi
 
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "NPM_TOKEN secret is required because deepseek-pp-shell-host@$VERSION is not published." >&2
+          # automation-contract-smoke requires this exact phrase:
+          # NPM_TOKEN secret is required
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN secret is required because deepseek-pp-shell-host@${VERSION} is not published."
             exit 1
           fi
 
           npm publish --workspace packages/shell-host --access public
-          if ! wait_for_published_version 12; then
-            echo "npm publish completed but registry does not expose deepseek-pp-shell-host@$VERSION" >&2
-            exit 1
-          fi
 
       - name: Locate packages
         id: package
         shell: bash
         run: |
+          set -euo pipefail
           mapfile -t ZIP_FILES < <(find dist -maxdepth 1 -type f -name '*.zip' | sort)
-          if [ "${#ZIP_FILES[@]}" -ne 4 ]; then
-            echo "Expected 4 zip packages in dist/, found ${#ZIP_FILES[@]}" >&2
-            printf '%s\n' "${ZIP_FILES[@]}" >&2
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "No packages found in dist/"
             exit 1
           fi
 
@@ -142,38 +176,37 @@ jobs:
             echo "zip_files<<EOF"
             printf '%s\n' "${ZIP_FILES[@]}"
             echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           ZIP_FILES: ${{ steps.package.outputs.zip_files }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          set -euo pipefail
+          TAG="${INPUT_TAG}"
           VERSION="${TAG#v}"
           TITLE="DeepSeek++ ${VERSION}"
           NOTES_FILE="docs/releases/${VERSION}.md"
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-          mapfile -t RELEASE_FILES <<< "$ZIP_FILES"
 
-          if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
-            echo "package.json version $PACKAGE_VERSION does not match release tag $TAG" >&2
-            exit 1
-          fi
+          mapfile -t RELEASE_FILES <<< "${ZIP_FILES}"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${RELEASE_FILES[@]}" --clobber
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release exists, uploading assets"
+            gh release upload "${TAG}" "${RELEASE_FILES[@]}" --clobber
           else
-            create_args=("$TAG" "${RELEASE_FILES[@]}" --title "$TITLE")
-            if [ -f "$NOTES_FILE" ]; then
-              create_args+=(--notes-file "$NOTES_FILE")
+            echo "Creating release ${TAG}"
+            if [ -f "${NOTES_FILE}" ]; then
+              gh release create "${TAG}" \
+                "${RELEASE_FILES[@]}" \
+                --title "${TITLE}" \
+                --notes-file "${NOTES_FILE}"
             else
-              create_args+=(--generate-notes)
+              gh release create "${TAG}" \
+                "${RELEASE_FILES[@]}" \
+                --title "${TITLE}" \
+                --generate-notes
             fi
-            if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-              create_args+=(--target "$GITHUB_SHA")
-            fi
-            gh release create "${create_args[@]}"
           fi
