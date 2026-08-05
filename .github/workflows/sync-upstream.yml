@@ -1,0 +1,278 @@
+name: Sync Upstream DeepSeek++
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+# MUST match release.yml — only one of sync/release can run at a time
+concurrency:
+  group: deepseek-release-lock
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync zhu1090093659/deepseek-pp
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      changed: ${{ steps.upstream.outputs.changed }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.release_gate.outputs.should_release || 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Fetch upstream
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/zhu1090093659/deepseek-pp.git || true
+          git fetch upstream main
+
+          LOCAL="$(git rev-parse HEAD)"
+          REMOTE="$(git rev-parse upstream/main)"
+
+          echo "LOCAL=${LOCAL}"
+          echo "REMOTE=${REMOTE}"
+
+          if [ "${LOCAL}" = "${REMOTE}" ]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Stop if no update
+        if: steps.upstream.outputs.changed != 'true'
+        run: echo "No upstream update — skipping sync, tag and release."
+
+      - name: Backup local .github
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/github_backup
+          mkdir -p /tmp/github_backup
+          cp -a .github /tmp/github_backup/
+
+      - name: Sync upstream
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout main
+          git reset --hard upstream/main
+
+      - name: Restore .github workflows
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .github
+          cp -a /tmp/github_backup/.github .
+          echo "Restored workflows:"
+          find .github/workflows -type f | sort
+
+      - name: Verify critical workflows exist
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/release.yml
+          test -f .github/workflows/ci.yml
+          test -f .github/workflows/sync-upstream.yml
+          grep -q 'NPM_TOKEN secret is required' .github/workflows/release.yml
+
+      - name: Commit sync
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f .github
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "No changes after restore"
+            exit 0
+          fi
+
+          git commit -m "sync upstream zhu1090093659/deepseek-pp"
+
+      - name: Push main
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push \
+            "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}" \
+            main \
+            --force
+
+      - name: Wait until origin/main matches local HEAD
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED="$(git rev-parse HEAD)"
+          echo "Waiting for origin/main == ${EXPECTED}"
+
+          for i in $(seq 1 30); do
+            git fetch origin main
+            REMOTE="$(git rev-parse origin/main)"
+            echo "Attempt ${i}: origin/main=${REMOTE}"
+            if [ "${REMOTE}" = "${EXPECTED}" ]; then
+              echo "origin/main is up to date"
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Timed out waiting for origin/main"
+          exit 1
+
+      - name: Setup Node
+        if: steps.upstream.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Read version
+        if: steps.upstream.outputs.changed == 'true'
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout -B main origin/main
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "VERSION=${VERSION} TAG=${TAG}"
+
+      - name: Ensure tag points to complete tree
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          EXPECTED="$(git rev-parse HEAD)"
+
+          git fetch origin main --tags
+
+          tree_complete() {
+            local sha="$1"
+            git cat-file -e "${sha}:.github/workflows/ci.yml" 2>/dev/null \
+              && git cat-file -e "${sha}:.github/workflows/release.yml" 2>/dev/null \
+              && git cat-file -e "${sha}:package.json" 2>/dev/null
+          }
+
+          if ! tree_complete "${EXPECTED}"; then
+            echo "ERROR: current HEAD is incomplete — refusing to tag"
+            exit 1
+          fi
+
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            EXISTING="$(git rev-list -n 1 "refs/tags/${TAG}")"
+            echo "Tag ${TAG} already exists at ${EXISTING}"
+
+            if tree_complete "${EXISTING}" && [ "${EXISTING}" = "${EXPECTED}" ]; then
+              echo "Existing tag is correct and complete — keep it"
+              exit 0
+            fi
+
+            echo "Existing tag is incomplete or points elsewhere — moving to ${EXPECTED}"
+            git tag -f "${TAG}" "${EXPECTED}"
+            git push --force \
+              "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}" \
+              "refs/tags/${TAG}"
+            exit 0
+          fi
+
+          echo "Creating tag ${TAG} at ${EXPECTED}"
+          git tag "${TAG}" "${EXPECTED}"
+          git push \
+            "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}" \
+            "${TAG}"
+
+      - name: Wait until tag is visible and complete
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+
+          tree_complete() {
+            local sha="$1"
+            git cat-file -e "${sha}:.github/workflows/ci.yml" 2>/dev/null \
+              && git cat-file -e "${sha}:.github/workflows/release.yml" 2>/dev/null
+          }
+
+          for i in $(seq 1 30); do
+            git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
+            if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+              GOT="$(git rev-list -n 1 "refs/tags/${TAG}")"
+              echo "Attempt ${i}: tag ${TAG} -> ${GOT}"
+              if tree_complete "${GOT}"; then
+                echo "Tag is visible and tree is complete"
+                exit 0
+              fi
+              echo "Tag visible but tree still incomplete"
+            else
+              echo "Attempt ${i}: tag not yet visible"
+            fi
+            sleep 5
+          done
+
+          echo "Timed out waiting for complete tag ${TAG}"
+          exit 1
+
+      - name: Decide whether to release
+        if: steps.upstream.outputs.changed == 'true'
+        id: release_gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists — skip"
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Release ${TAG} missing — will trigger after this job finishes"
+            echo "should_release=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+  # Trigger only AFTER sync job has fully finished (needs: sync).
+  # Combined with concurrency group, Release cannot overlap Sync.
+  trigger-release:
+    name: Trigger Release Extension
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' && needs.sync.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger release workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.sync.outputs.tag }}"
+          echo "Sync finished. Triggering Release Extension for ${TAG}"
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            -f "tag=${TAG}"
