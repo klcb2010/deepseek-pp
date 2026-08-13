@@ -1,0 +1,482 @@
+name: Sync Upstream DeepSeek++
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+# MUST match release.yml — only one of sync/release can run at a time
+concurrency:
+  group: deepseek-release-lock
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync zhu1090093659/deepseek-pp
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      changed: ${{ steps.upstream.outputs.changed }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.release_gate.outputs.should_release || 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Fetch upstream and check for real update
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "检查上游 DeepSeek++ 是否有新提交"
+          echo "========================================"
+
+          git remote add upstream https://github.com/zhu1090093659/deepseek-pp.git 2>/dev/null || true
+          git fetch upstream main
+
+          REMOTE="$(git rev-parse upstream/main)"
+          LOCAL="$(git rev-parse HEAD)"
+
+          echo "当前 origin/main HEAD : ${LOCAL}"
+          echo "当前 upstream/main    : ${REMOTE}"
+
+          SYNC_FILE=".sync/upstream-main.sha"
+
+          LAST_SYNC=""
+
+          if [ -f "${SYNC_FILE}" ]; then
+            LAST_SYNC="$(tr -d '[:space:]' < "${SYNC_FILE}")"
+            echo "上次已同步 upstream   : ${LAST_SYNC}"
+          else
+            echo "未找到上次同步记录"
+          fi
+
+          echo ""
+
+          # ---------------------------------------------------------
+          # 第一优先级：
+          # 使用 .sync/upstream-main.sha 判断上游是否真的产生了新提交
+          # ---------------------------------------------------------
+          if [ -n "${LAST_SYNC}" ] && [ "${REMOTE}" = "${LAST_SYNC}" ]; then
+            echo "========================================"
+            echo "上游没有新提交"
+            echo "无需同步，跳过 commit / push / tag / release"
+            echo "========================================"
+
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # ---------------------------------------------------------
+          # 如果没有同步记录：
+          # 尝试从 Git 历史中判断当前 origin/main 是否已经包含 upstream/main
+          # 仅用于兼容旧版本 Action 第一次运行
+          # ---------------------------------------------------------
+          if [ -z "${LAST_SYNC}" ]; then
+            if git merge-base --is-ancestor "${REMOTE}" "${LOCAL}"; then
+              echo "========================================"
+              echo "检测到 upstream/main 已经包含在当前 HEAD 中"
+              echo "判定：上游没有需要同步的新内容"
+              echo "========================================"
+
+              mkdir -p .sync
+              printf '%s\n' "${REMOTE}" > "${SYNC_FILE}"
+
+              if git diff --quiet -- "${SYNC_FILE}" 2>/dev/null; then
+                echo "changed=false" >> "${GITHUB_OUTPUT}"
+                exit 0
+              fi
+
+              git config user.name "github-actions"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+              git add "${SYNC_FILE}"
+
+              if git diff --cached --quiet; then
+                echo "同步记录无需更新"
+                echo "changed=false" >> "${GITHUB_OUTPUT}"
+                exit 0
+              fi
+
+              git commit -m "chore: record upstream sync state"
+
+              git push \
+                "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}" \
+                main
+
+              echo "changed=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          fi
+
+          echo "========================================"
+          echo "发现上游新提交"
+          echo "需要执行同步"
+          echo "========================================"
+
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Stop if no update
+        if: steps.upstream.outputs.changed != 'true'
+        run: |
+          echo "========================================"
+          echo "上游无更新"
+          echo "本次 Action 正常结束"
+          echo "不会执行同步、tag 或 release"
+          echo "========================================"
+
+      - name: Backup local .github
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "备份本地 .github..."
+
+          rm -rf /tmp/github_backup
+          mkdir -p /tmp/github_backup
+
+          cp -a .github /tmp/github_backup/
+
+          echo "本地 .github 已备份"
+
+      - name: Sync upstream
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "开始同步 upstream/main"
+          echo "========================================"
+
+          git checkout main
+          git reset --hard upstream/main
+
+          echo "upstream 内容已同步"
+
+      - name: Restore .github workflows
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "恢复本地 .github..."
+
+          rm -rf .github
+          cp -a /tmp/github_backup/.github .
+
+          echo "恢复后的 workflows："
+          find .github/workflows -type f | sort
+
+      - name: Verify critical workflows exist
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "检查关键 Workflow"
+          echo "========================================"
+
+          test -f .github/workflows/release.yml
+          test -f .github/workflows/ci.yml
+          test -f .github/workflows/sync-upstream.yml
+
+          grep -q 'NPM_TOKEN secret is required' .github/workflows/release.yml
+
+          echo "关键 Workflow 检查通过"
+
+      - name: Record upstream sync state
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "记录本次同步的 upstream commit..."
+
+          REMOTE="$(git rev-parse upstream/main)"
+
+          mkdir -p .sync
+          printf '%s\n' "${REMOTE}" > .sync/upstream-main.sha
+
+          echo "本次 upstream SHA:"
+          cat .sync/upstream-main.sha
+
+      - name: Commit sync
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "准备提交同步结果"
+          echo "========================================"
+
+          git config user.name "github-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f .github
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "同步后没有实际文件变化"
+            echo "不会创建空提交"
+
+            exit 0
+          fi
+
+          echo "检测到实际文件变化："
+          git diff --cached --stat
+
+          git commit -m "sync upstream zhu1090093659/deepseek-pp"
+
+          echo "同步提交创建成功"
+
+      - name: Push main
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "推送 main"
+          echo "========================================"
+
+          git push \
+            "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}" \
+            main \
+            --force
+
+          echo "main 推送完成"
+
+      - name: Wait until origin/main matches local HEAD
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED="$(git rev-parse HEAD)"
+
+          echo "========================================"
+          echo "等待 origin/main 更新"
+          echo "期望 SHA: ${EXPECTED}"
+          echo "========================================"
+
+          for i in $(seq 1 30); do
+            git fetch origin main
+
+            REMOTE="$(git rev-parse origin/main)"
+
+            echo "第 ${i} 次检查：origin/main=${REMOTE}"
+
+            if [ "${REMOTE}" = "${EXPECTED}" ]; then
+              echo "origin/main 已与本地 HEAD 一致"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "等待 origin/main 超时"
+          exit 1
+
+      - name: Setup Node
+        if: steps.upstream.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Read version
+        if: steps.upstream.outputs.changed == 'true'
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git checkout -B main origin/main
+
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+          echo "========================================"
+          echo "版本: ${VERSION}"
+          echo "Tag : ${TAG}"
+          echo "========================================"
+
+      - name: Ensure tag points to complete tree
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.version.outputs.tag }}"
+          EXPECTED="$(git rev-parse HEAD)"
+
+          echo "========================================"
+          echo "检查 Tag ${TAG}"
+          echo "========================================"
+
+          git fetch origin main --tags
+
+          tree_complete() {
+            local sha="$1"
+
+            git cat-file -e "${sha}:.github/workflows/ci.yml" 2>/dev/null \
+              && git cat-file -e "${sha}:.github/workflows/release.yml" 2>/dev/null \
+              && git cat-file -e "${sha}:package.json" 2>/dev/null
+          }
+
+          if ! tree_complete "${EXPECTED}"; then
+            echo "ERROR: 当前 HEAD 不完整，拒绝创建 Tag"
+            exit 1
+          fi
+
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            EXISTING="$(git rev-list -n 1 "refs/tags/${TAG}")"
+
+            echo "Tag ${TAG} 已存在"
+            echo "现有 SHA: ${EXISTING}"
+            echo "期望 SHA: ${EXPECTED}"
+
+            if tree_complete "${EXISTING}" && [ "${EXISTING}" = "${EXPECTED}" ]; then
+              echo "现有 Tag 正确且完整，无需修改"
+              exit 0
+            fi
+
+            echo "现有 Tag 不完整或指向错误提交"
+            echo "移动 Tag 到 ${EXPECTED}"
+
+            git tag -f "${TAG}" "${EXPECTED}"
+
+            git push --force \
+              "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}" \
+              "refs/tags/${TAG}"
+
+            echo "Tag 已修复"
+            exit 0
+          fi
+
+          echo "创建 Tag ${TAG} -> ${EXPECTED}"
+
+          git tag "${TAG}" "${EXPECTED}"
+
+          git push \
+            "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}" \
+            "${TAG}"
+
+          echo "Tag 创建完成"
+
+      - name: Wait until tag is visible and complete
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.version.outputs.tag }}"
+
+          tree_complete() {
+            local sha="$1"
+
+            git cat-file -e "${sha}:.github/workflows/ci.yml" 2>/dev/null \
+              && git cat-file -e "${sha}:.github/workflows/release.yml" 2>/dev/null
+          }
+
+          echo "========================================"
+          echo "等待 Tag ${TAG} 可见"
+          echo "========================================"
+
+          for i in $(seq 1 30); do
+            git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
+
+            if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+              GOT="$(git rev-list -n 1 "refs/tags/${TAG}")"
+
+              echo "第 ${i} 次检查：Tag ${TAG} -> ${GOT}"
+
+              if tree_complete "${GOT}"; then
+                echo "Tag 已可见且内容完整"
+                exit 0
+              fi
+
+              echo "Tag 已可见，但内容仍不完整"
+            else
+              echo "第 ${i} 次检查：Tag 尚未可见"
+            fi
+
+            sleep 5
+          done
+
+          echo "等待完整 Tag 超时"
+          exit 1
+
+      - name: Decide whether to release
+        if: steps.upstream.outputs.changed == 'true'
+        id: release_gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.version.outputs.tag }}"
+
+          echo "========================================"
+          echo "检查 Release ${TAG}"
+          echo "========================================"
+
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在"
+            echo "跳过 Release"
+
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Release ${TAG} 不存在"
+            echo "同步 Job 完成后将触发 Release"
+
+            echo "should_release=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+  # Trigger only AFTER sync job has fully finished (needs: sync).
+  # Combined with concurrency group, Release cannot overlap Sync.
+  trigger-release:
+    name: Trigger Release Extension
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' && needs.sync.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger release workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ needs.sync.outputs.tag }}"
+
+          echo "========================================"
+          echo "同步完成"
+          echo "触发 Release Extension"
+          echo "Tag: ${TAG}"
+          echo "========================================"
+
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            -f "tag=${TAG}"
+
+          echo "Release Extension 已触发"
